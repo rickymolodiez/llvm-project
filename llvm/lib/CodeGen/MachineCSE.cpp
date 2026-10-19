@@ -14,6 +14,7 @@
 
 #include "llvm/CodeGen/MachineCSE.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/ScopedHashTable.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
@@ -28,6 +29,7 @@
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineOperand.h"
+#include "llvm/CodeGen/MachinePostDominators.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
@@ -51,14 +53,14 @@ using namespace llvm;
 #define DEBUG_TYPE "machine-cse"
 
 STATISTIC(NumCoalesces, "Number of copies coalesced");
-STATISTIC(NumCSEs,      "Number of common subexpression eliminated");
-STATISTIC(NumPREs,      "Number of partial redundant expression"
-                        " transformed to fully redundant");
+STATISTIC(NumCSEs, "Number of common subexpression eliminated");
+STATISTIC(NumPREs, "Number of partial redundant expression"
+                   " transformed to fully redundant");
 STATISTIC(NumPhysCSEs,
           "Number of physreg referencing common subexpr eliminated");
 STATISTIC(NumCrossBBCSEs,
           "Number of cross-MBB physreg referencing CS eliminated");
-STATISTIC(NumCommutes,  "Number of copies coalesced after commuting");
+STATISTIC(NumCommutes, "Number of copies coalesced after commuting");
 
 // Threshold to avoid excessive cost to compute isProfitableToCSE.
 static cl::opt<int>
@@ -75,6 +77,7 @@ class MachineCSEImpl {
   const TargetInstrInfo *TII = nullptr;
   const TargetRegisterInfo *TRI = nullptr;
   MachineDominatorTree *DT = nullptr;
+  std::optional<MachinePostDominatorTree> PDT;
   MachineRegisterInfo *MRI = nullptr;
   MachineBlockFrequencyInfo *MBFI = nullptr;
 
@@ -130,6 +133,7 @@ private:
   bool isProfitableToHoistInto(MachineBasicBlock *CandidateBB,
                                MachineBasicBlock *MBB, MachineBasicBlock *MBB1);
   void releaseMemory();
+  MachinePostDominatorTree &buildOrGetPDT(MachineFunction &MF);
 };
 
 class MachineCSELegacy : public MachineFunctionPass {
@@ -301,7 +305,8 @@ bool MachineCSEImpl::hasLivePhysRegDefUses(const MachineInstr *MI,
   // Next, collect all defs into PhysDefs.  If any is already in PhysRefs
   // (which currently contains only uses), set the PhysUseDef flag.
   PhysUseDef = false;
-  MachineBasicBlock::const_iterator I = MI; I = std::next(I);
+  MachineBasicBlock::const_iterator I = MI;
+  I = std::next(I);
   for (const auto &MOP : llvm::enumerate(MI->operands())) {
     const MachineOperand &MO = MOP.value();
     if (!MO.isReg() || !MO.isDef())
@@ -347,12 +352,13 @@ bool MachineCSEImpl::PhysRegDefsReach(MachineInstr *CSMI, MachineInstr *MI,
     for (const auto &PhysDef : PhysDefs) {
       if (MRI->isAllocatable(PhysDef.second) || MRI->isReserved(PhysDef.second))
         // Avoid extending live range of physical registers if they are
-        //allocatable or reserved.
+        // allocatable or reserved.
         return false;
     }
     CrossMBB = true;
   }
-  MachineBasicBlock::const_iterator I = CSMI; I = std::next(I);
+  MachineBasicBlock::const_iterator I = CSMI;
+  I = std::next(I);
   MachineBasicBlock::const_iterator E = MI;
   MachineBasicBlock::const_iterator EE = CSMBB->end();
   unsigned LookAheadLeft = LookAheadLimit;
@@ -445,7 +451,7 @@ bool MachineCSEImpl::isProfitableToCSE(Register CSReg, Register Reg,
   bool MayIncreasePressure = true;
   if (CSReg.isVirtual() && Reg.isVirtual()) {
     MayIncreasePressure = false;
-    SmallPtrSet<MachineInstr*, 8> CSUses;
+    SmallPtrSet<MachineInstr *, 8> CSUses;
     int NumOfUses = 0;
     for (MachineInstr &MI : MRI->use_nodbg_instructions(CSReg)) {
       CSUses.insert(&MI);
@@ -464,7 +470,8 @@ bool MachineCSEImpl::isProfitableToCSE(Register CSReg, Register Reg,
         }
       }
   }
-  if (!MayIncreasePressure) return true;
+  if (!MayIncreasePressure)
+    return true;
 
   // Heuristics #1: Don't CSE "cheap" computation if the def is not local or in
   // an immediate predecessor. We don't want to increase register pressure and
@@ -609,9 +616,13 @@ bool MachineCSEImpl::ProcessBlockCSE(MachineBasicBlock *MBB) {
     // definition, so it's necessary to use `isConvergent` to prevent illegally
     // CSE-ing the subset of `isConvergent` instructions which do fall into this
     // extended definition.
-    if (MI.isConvergent() && MI.getParent() != CSMI->getParent()) {
+    if (MI.isConvergent() && MI.getParent() != CSMI->getParent() &&
+        !(DT->dominates(CSMI, &MI) &&
+          buildOrGetPDT(*MI.getMF())
+              .dominates(MI.getParent(), CSMI->getParent()))) {
       LLVM_DEBUG(dbgs() << "*** Convergent MI and subexpression exist in "
-                           "different BBs, avoid CSE!\n");
+                           "different BB such that A does not dominate B, and "
+                           "B does not post-dominate A, avoid CSE!\n");
       VNT.insert(&MI, CurrVN++);
       Exps.push_back(&MI);
       continue;
@@ -764,9 +775,9 @@ void MachineCSEImpl::ExitScopeIfDone(
 }
 
 bool MachineCSEImpl::PerformCSE(MachineDomTreeNode *Node) {
-  SmallVector<MachineDomTreeNode*, 32> Scopes;
-  SmallVector<MachineDomTreeNode*, 8> WorkList;
-  DenseMap<MachineDomTreeNode*, unsigned> OpenChildren;
+  SmallVector<MachineDomTreeNode *, 32> Scopes;
+  SmallVector<MachineDomTreeNode *, 8> WorkList;
+  DenseMap<MachineDomTreeNode *, unsigned> OpenChildren;
 
   CurrVN = 0;
 
@@ -798,11 +809,8 @@ bool MachineCSEImpl::PerformCSE(MachineDomTreeNode *Node) {
 // to exclude instrs created by PRE that won't be CSEed later.
 bool MachineCSEImpl::isPRECandidate(MachineInstr *MI,
                                     SmallSet<MCRegister, 8> &PhysRefs) {
-  if (!isCSECandidate(MI) ||
-      MI->isNotDuplicable() ||
-      MI->mayLoad() ||
-      TII->isAsCheapAsAMove(*MI) ||
-      MI->getNumDefs() != 1 ||
+  if (!isCSECandidate(MI) || MI->isNotDuplicable() || MI->mayLoad() ||
+      TII->isAsCheapAsAMove(*MI) || MI->getNumDefs() != 1 ||
       MI->getNumExplicitDefs() != 1)
     return false;
 
@@ -932,6 +940,7 @@ void MachineCSEImpl::releaseMemory() {
   ScopeMap.clear();
   PREMap.clear();
   Exps.clear();
+  PDT.reset();
 }
 
 bool MachineCSEImpl::run(MachineFunction &MF) {
@@ -944,6 +953,12 @@ bool MachineCSEImpl::run(MachineFunction &MF) {
   ChangedCSE = PerformCSE(DT->getRootNode());
   releaseMemory();
   return ChangedPRE || ChangedCSE;
+}
+
+MachinePostDominatorTree &MachineCSEImpl::buildOrGetPDT(MachineFunction &MF) {
+  if (!PDT)
+    PDT.emplace(MF);
+  return *PDT;
 }
 
 PreservedAnalyses MachineCSEPass::run(MachineFunction &MF,
