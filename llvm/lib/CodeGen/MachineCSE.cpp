@@ -134,6 +134,7 @@ private:
                                MachineBasicBlock *MBB, MachineBasicBlock *MBB1);
   void releaseMemory();
   MachinePostDominatorTree &buildOrGetPDT(MachineFunction &MF);
+  static bool isBlockInACycle(MachineBasicBlock *MBB);
 };
 
 class MachineCSELegacy : public MachineFunctionPass {
@@ -617,12 +618,16 @@ bool MachineCSEImpl::ProcessBlockCSE(MachineBasicBlock *MBB) {
     // CSE-ing the subset of `isConvergent` instructions which do fall into this
     // extended definition.
     if (MI.isConvergent() && MI.getParent() != CSMI->getParent() &&
-        !(DT->dominates(CSMI, &MI) &&
-          buildOrGetPDT(*MI.getMF())
-              .dominates(MI.getParent(), CSMI->getParent()))) {
-      LLVM_DEBUG(dbgs() << "*** Convergent MI and subexpression exist in "
-                           "different BB such that A does not dominate B, and "
-                           "B does not post-dominate A, avoid CSE!\n");
+        (!(DT->dominates(CSMI, &MI) &&
+           buildOrGetPDT(*MI.getMF())
+               .dominates(MI.getParent(), CSMI->getParent())) ||
+         isBlockInACycle(MI.getParent()) ||
+         isBlockInACycle(CSMI->getParent()))) {
+      LLVM_DEBUG(
+          dbgs()
+          << "*** Convergent MI and subexpression exist in "
+             "different BB where dominance or post-dominance checks fail, "
+             "or either BB is in a cycle, avoid CSE!\n");
       VNT.insert(&MI, CurrVN++);
       Exps.push_back(&MI);
       continue;
@@ -959,6 +964,14 @@ MachinePostDominatorTree &MachineCSEImpl::buildOrGetPDT(MachineFunction &MF) {
   if (!PDT)
     PDT.emplace(MF);
   return *PDT;
+}
+
+bool MachineCSEImpl::isBlockInACycle(MachineBasicBlock *MBB) {
+  for (MachineBasicBlock *postBB : MBB->successors())
+    for (MachineBasicBlock *B : depth_first(postBB))
+      if (B == MBB)
+        return true;
+  return false;
 }
 
 PreservedAnalyses MachineCSEPass::run(MachineFunction &MF,
